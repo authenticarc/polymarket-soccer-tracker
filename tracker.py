@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
 Polymarket Soccer Tracker (UCL + EPL)
-- Uses Gamma API to discover events/markets by tag_id
-- Uses CLOB API to fetch orderbooks (best bid/ask, spread, etc.)
-- Writes daily CSV snapshots under ./data/
 
-Key fixes:
-- Robust parsing of Gamma "clobTokenIds" which may appear as:
-    * list
-    * JSON-in-string (e.g. '["5860...","1234..."]')
-    * malformed/truncated string (e.g. '["5860...",')
-  We extract token IDs via JSON parse first, then regex fallback.
+Fixes:
+- Robust clobTokenIds parsing (handles doubled quotes like [""a"", ""b""])
+- GUARANTEE token_ids is List[str] (never a raw JSON string)
+- Batch fetch via POST /books, with fallback GET /book?token_id=...
+- Compute best bid/ask without assuming order sorting
+- Write extra debug columns to CSV for diagnosis
 
-Env vars:
+Env:
 - GAMMA_BASE (default https://gamma-api.polymarket.com)
 - CLOB_BASE  (default https://clob.polymarket.com)
 - LEAGUES    (default "UCL,EPL")
-- TAG_UCL    (default "13")  # you can pin
-- TAG_EPL    (default "2")   # you can pin
+- TAG_UCL    (default "100977")
+- TAG_EPL    (default "82")
 - LIMIT_EVENTS (default 200)
 - TIMEOUT_SEC (default 20)
 - OUT_DIR    (default "data")
+- DEBUG      (default "0")  -> set "1" for debug prints
 """
 
 import os
@@ -43,36 +41,34 @@ CLOB_BASE = os.getenv("CLOB_BASE", "https://clob.polymarket.com").rstrip("/")
 OUT_DIR = os.getenv("OUT_DIR", "data")
 LIMIT_EVENTS = int(os.getenv("LIMIT_EVENTS", "200"))
 TIMEOUT_SEC = int(os.getenv("TIMEOUT_SEC", "20"))
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
-UA = "polymarket-soccer-tracker/1.1 (+github-actions)"
+UA = "polymarket-soccer-tracker/1.4 (+github-actions)"
 
 LEAGUE_DEFAULTS = {
     "UCL": {"tag_env": "TAG_UCL", "tag_default": "100977"},
     "EPL": {"tag_env": "TAG_EPL", "tag_default": "82"},
 }
 
-# Token id patterns:
-# - huge decimal integer strings are common
-# - sometimes 0x... asset ids exist in some contexts
+# Polymarket CLOB token ids are usually huge decimal strings
 TOKEN_EXTRACT_RE = re.compile(r"(0x[0-9a-fA-F]+|\d{10,})")
 
 
 # -----------------------------
 # HTTP helpers
 # -----------------------------
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": UA, "Accept": "application/json"})
+
+
 def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-    r = requests.get(url, params=params, timeout=TIMEOUT_SEC, headers={"User-Agent": UA})
+    r = _SESSION.get(url, params=params, timeout=TIMEOUT_SEC)
     r.raise_for_status()
     return r.json()
 
 
 def _post(url: str, payload: Any) -> Any:
-    r = requests.post(
-        url,
-        json=payload,
-        timeout=TIMEOUT_SEC,
-        headers={"User-Agent": UA, "Content-Type": "application/json"},
-    )
+    r = _SESSION.post(url, json=payload, timeout=TIMEOUT_SEC, headers={"Content-Type": "application/json"})
     r.raise_for_status()
     return r.json()
 
@@ -83,78 +79,6 @@ def utc_iso_now() -> str:
 
 def chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i : i + n] for i in range(0, len(lst), n)]
-
-
-# -----------------------------
-# Parsing: clobTokenIds (critical fix)
-# -----------------------------
-def parse_clob_token_ids(x: Any) -> List[str]:
-    """
-    Gamma clobTokenIds can be:
-      - list: ["5860...", "1234..."]
-      - JSON string: '["5860...","1234..."]'
-      - malformed/truncated string: '["5860...",'
-      - comma-separated: '5860...,1234...'
-    Return a cleaned list[str] containing only plausible token ids.
-    """
-    if x is None:
-        return []
-
-    # Case 1: already a list
-    if isinstance(x, list):
-        vals = [str(i).strip() for i in x if i is not None]
-        return _clean_token_list(vals)
-
-    # Case 2: string
-    if isinstance(x, str):
-        s = x.strip()
-
-        # Try JSON first (best case)
-        try:
-            y = json.loads(s)
-            if isinstance(y, list):
-                vals = [str(i).strip() for i in y if i is not None]
-                return _clean_token_list(vals)
-        except Exception:
-            pass
-
-        # Fallback: regex extraction (works even if truncated)
-        extracted = [m.group(1) for m in TOKEN_EXTRACT_RE.finditer(s)]
-        if extracted:
-            return _dedup_preserve_order(_clean_token_list(extracted))
-
-        # Fallback: comma-separated
-        if "," in s:
-            vals = [t.strip() for t in s.split(",") if t.strip()]
-            return _dedup_preserve_order(_clean_token_list(vals))
-
-        return _clean_token_list([s])
-
-    # Case 3: other types
-    return _clean_token_list([str(x).strip()])
-
-
-def _clean_token_list(vals: List[str]) -> List[str]:
-    out: List[str] = []
-    for v in vals:
-        if not v:
-            continue
-        v2 = v.strip().strip('"').strip("'")
-        if not v2:
-            continue
-        # Reject junk artifacts like "[" or "]"
-        if v2 in ("[", "]"):
-            continue
-        # Accept if it matches our extraction regex fully OR looks like 0x...
-        if v2.startswith("0x"):
-            out.append(v2)
-        elif v2.isdigit() and len(v2) >= 10:
-            out.append(v2)
-        else:
-            # sometimes we get fragments; try extracting tokens from the fragment
-            frag = [m.group(1) for m in TOKEN_EXTRACT_RE.finditer(v2)]
-            out.extend(frag)
-    return _dedup_preserve_order(out)
 
 
 def _dedup_preserve_order(vals: List[str]) -> List[str]:
@@ -168,12 +92,70 @@ def _dedup_preserve_order(vals: List[str]) -> List[str]:
 
 
 # -----------------------------
+# Parsing: clobTokenIds (critical)
+# -----------------------------
+def parse_clob_token_ids(raw: Any) -> List[str]:
+    """
+    Accepts:
+      - list: ["5860...", "1234..."]
+      - JSON string: '["5860...","1234..."]'
+      - doubled-quote JSON string: '[""5860..."", ""1234...""]'
+      - truncated/malformed -> regex fallback
+    Returns: list[str] of plausible token ids (digits or 0x..), deduped.
+    """
+    if raw is None:
+        return []
+
+    # already list
+    if isinstance(raw, list):
+        return _clean_token_list([str(x) for x in raw if x is not None])
+
+    # string-like
+    s = str(raw).strip()
+    if not s:
+        return []
+
+    # 1) normalize doubled quotes: [""a"", ""b""] -> ["a", "b"]
+    s_norm = s.replace('""', '"')
+
+    # 2) try json.loads
+    try:
+        y = json.loads(s_norm)
+        if isinstance(y, list):
+            return _clean_token_list([str(x) for x in y if x is not None])
+    except Exception:
+        pass
+
+    # 3) regex fallback (works even if truncated)
+    extracted = [m.group(1) for m in TOKEN_EXTRACT_RE.finditer(s_norm)]
+    return _clean_token_list(extracted)
+
+
+def _clean_token_list(vals: List[str]) -> List[str]:
+    out: List[str] = []
+    for v in vals:
+        if v is None:
+            continue
+        v2 = str(v).strip().strip('"').strip("'")
+        if not v2 or v2 in ("[", "]"):
+            continue
+
+        if v2.startswith("0x"):
+            out.append(v2)
+        elif v2.isdigit() and len(v2) >= 10:
+            out.append(v2)
+        else:
+            # if it's still a fragment, extract tokens from it
+            frag = [m.group(1) for m in TOKEN_EXTRACT_RE.finditer(v2)]
+            out.extend(frag)
+
+    return _dedup_preserve_order(out)
+
+
+# -----------------------------
 # Gamma fetching
 # -----------------------------
 def fetch_events_by_tag(tag_id: str) -> List[Dict[str, Any]]:
-    """
-    Fetch active, open events for given tag_id.
-    """
     events: List[Dict[str, Any]] = []
     offset = 0
     page = 100
@@ -188,11 +170,10 @@ def fetch_events_by_tag(tag_id: str) -> List[Dict[str, Any]]:
                 "archived": "false",
                 "limit": str(min(page, LIMIT_EVENTS - len(events))),
                 "offset": str(offset),
-                # keep related tags on; events may have nested tags
                 "related_tags": "true",
             },
         )
-        if not isinstance(batch, list) or len(batch) == 0:
+        if not isinstance(batch, list) or not batch:
             break
         events.extend(batch)
         offset += len(batch)
@@ -203,10 +184,6 @@ def fetch_events_by_tag(tag_id: str) -> List[Dict[str, Any]]:
 
 
 def fetch_market_full(market_id: Any) -> Optional[Dict[str, Any]]:
-    """
-    Fetch full market object by id.
-    Returns None if fetch fails.
-    """
     if market_id is None:
         return None
     try:
@@ -223,29 +200,46 @@ def enable_orderbook(market: Dict[str, Any]) -> bool:
 # CLOB fetching
 # -----------------------------
 def fetch_books_batch(token_ids: List[str]) -> List[Dict[str, Any]]:
-    """
-    POST /books
-    Body: [{"token_id":"..."}]
-    """
     payload = [{"token_id": str(t)} for t in token_ids]
     res = _post(f"{CLOB_BASE}/books", payload)
-    if isinstance(res, list):
-        return res
-    # Some deployments might return dict; normalize to list
-    if isinstance(res, dict):
-        # best-effort: values as list
-        return list(res.values())
-    return []
+    return res if isinstance(res, list) else []
+
+
+def fetch_book_single(token_id: str) -> Optional[Dict[str, Any]]:
+    # /book?token_id=...
+    try:
+        return _get(f"{CLOB_BASE}/book", params={"token_id": str(token_id)})
+    except Exception:
+        return None
+
+
+def _pick_best_level(levels: List[Dict[str, Any]], pick: str) -> Tuple[Optional[float], Optional[float]]:
+    best_price = None
+    best_size = None
+    for lv in levels or []:
+        try:
+            p = float(lv.get("price"))
+            s = float(lv.get("size"))
+        except Exception:
+            continue
+        if best_price is None:
+            best_price, best_size = p, s
+            continue
+        if pick == "max_price":
+            if p > best_price:
+                best_price, best_size = p, s
+        else:
+            if p < best_price:
+                best_price, best_size = p, s
+    return best_price, best_size
 
 
 def best_from_book(book: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     bids = book.get("bids") or []
     asks = book.get("asks") or []
 
-    best_bid = float(bids[0]["price"]) if bids else None
-    best_bid_size = float(bids[0]["size"]) if bids else None
-    best_ask = float(asks[0]["price"]) if asks else None
-    best_ask_size = float(asks[0]["size"]) if asks else None
+    best_bid, best_bid_size = _pick_best_level(bids, "max_price")
+    best_ask, best_ask_size = _pick_best_level(asks, "min_price")
 
     mid = None
     spr = None
@@ -263,9 +257,10 @@ def snapshot_league(league: str, tag_id: str) -> pd.DataFrame:
     ts = utc_iso_now()
     events = fetch_events_by_tag(tag_id)
 
-    rows: List[Dict[str, Any]] = []
+    if DEBUG:
+        print(f"[{league}] events={len(events)} tag_id={tag_id}")
 
-    # We'll gather (market_id -> token_ids, meta) then batch books across all tokens
+    # market_records: one per market, holds token list
     market_records: List[Dict[str, Any]] = []
 
     for ev in events:
@@ -288,17 +283,18 @@ def snapshot_league(league: str, tag_id: str) -> pd.DataFrame:
             m_liq = m.get("liquidity")
             m_vol = m.get("volume") or m.get("volumeNum") or m.get("volume_num")
 
-            # events payload can be "light"; always try to parse clobTokenIds robustly
-            token_ids = parse_clob_token_ids(m.get("clobTokenIds"))
+            raw_clob = m.get("clobTokenIds")
+            token_ids = parse_clob_token_ids(raw_clob)
             ob = enable_orderbook(m)
 
-            # If missing or seems malformed, fetch full market and retry
-            if (not token_ids) or (ob is False):
+            # If missing or light payload, fetch full market and retry
+            if (not token_ids) or (ob is False) or (m.get("conditionId") is None):
                 full = fetch_market_full(m_id)
                 if full:
-                    token_ids = parse_clob_token_ids(full.get("clobTokenIds"))
+                    raw_clob = full.get("clobTokenIds")
+                    token_ids = parse_clob_token_ids(raw_clob)
                     ob = enable_orderbook(full)
-                    # replace market fields with full if present
+
                     m_slug = full.get("slug") or m_slug
                     m_question = full.get("question") or full.get("title") or m_question
                     m_liq = full.get("liquidity", m_liq)
@@ -307,43 +303,18 @@ def snapshot_league(league: str, tag_id: str) -> pd.DataFrame:
 
             if not ob:
                 continue
-            if not token_ids:
-                # record diagnostic row (no token ids)
-                rows.append(
-                    {
-                        "ts_utc": ts,
-                        "league": league,
-                        "event_id": ev_id,
-                        "event_slug": ev_slug,
-                        "event_title": ev_title,
-                        "event_start": ev_start,
-                        "market_id": m_id,
-                        "market_slug": m_slug,
-                        "market_question": m_question,
-                        "condition_id": m.get("conditionId"),
-                        "token_id": None,
-                        "outcome": None,
-                        "best_bid": None,
-                        "best_bid_size": None,
-                        "best_ask": None,
-                        "best_ask_size": None,
-                        "mid": None,
-                        "spread": None,
-                        "book_hash": None,
-                        "tick_size": None,
-                        "min_order_size": None,
-                        "last_trade_price": None,
-                        "liquidity": m_liq,
-                        "volume": m_vol,
-                        "error": "missing_clobTokenIds",
-                    }
-                )
+
+            # HARD GUARD: token_ids must be list[str] of digits/0x; otherwise skip and log
+            if not isinstance(token_ids, list) or any((not isinstance(t, str) or (not t.isdigit() and not t.startswith("0x"))) for t in token_ids):
+                if DEBUG:
+                    print(f"[{league}] BAD token_ids market_id={m_id} raw={raw_clob}")
                 continue
 
-            # Store market meta for later join
+            if len(token_ids) == 0:
+                continue
+
             outcomes = m.get("outcomes")
             if isinstance(outcomes, str):
-                # sometimes outcomes is JSON string
                 try:
                     outcomes = json.loads(outcomes)
                 except Exception:
@@ -359,6 +330,7 @@ def snapshot_league(league: str, tag_id: str) -> pd.DataFrame:
                     "market_slug": m_slug,
                     "market_question": m_question,
                     "condition_id": m.get("conditionId"),
+                    "clob_token_ids_raw": raw_clob,
                     "token_ids": token_ids,
                     "outcomes": outcomes if isinstance(outcomes, list) else None,
                     "liquidity": m_liq,
@@ -366,56 +338,50 @@ def snapshot_league(league: str, tag_id: str) -> pd.DataFrame:
                 }
             )
 
-    # Batch fetch all books for this league snapshot
+    # Collect unique tokens for batch books
     all_tokens: List[str] = []
     for rec in market_records:
         all_tokens.extend(rec["token_ids"])
     all_tokens = _dedup_preserve_order(all_tokens)
 
-    # If nothing to fetch, return what we have
     if not all_tokens:
-        return pd.DataFrame(rows)
+        return pd.DataFrame([])
 
-    # Fetch in chunks (be nice to API)
     token_to_book: Dict[str, Dict[str, Any]] = {}
-    errors: List[str] = []
 
+    # 1) batch fetch
     for part in chunk(all_tokens, 200):
-        try:
-            books = fetch_books_batch(part)
-        except Exception as e:
-            errors.append(f"books_batch_error: {e}")
-            time.sleep(0.2)
-            continue
-
-        # Index by asset_id/token_id in response
+        books = fetch_books_batch(part)
         for b in books:
             aid = b.get("asset_id") or b.get("token_id")
-            if aid is None:
-                continue
-            token_to_book[str(aid)] = b
-
-        # Also index by request order as a fallback if response lacks asset_id (rare)
+            if aid is not None:
+                token_to_book[str(aid)] = b
+        # safety: align by request order if needed
         if isinstance(books, list) and len(books) == len(part):
             for req, b in zip(part, books):
-                if req not in token_to_book:
-                    token_to_book[req] = b
+                token_to_book.setdefault(req, b)
+        time.sleep(0.12)
 
-        time.sleep(0.2)
+    # 2) expand to per-token rows; fallback to single-book if still missing
+    rows: List[Dict[str, Any]] = []
 
-    # Build rows per token outcome
     for rec in market_records:
-        token_ids = rec["token_ids"]
         outcomes = rec["outcomes"] or []
+        for idx, t in enumerate(rec["token_ids"]):
+            book = token_to_book.get(str(t))
 
-        for idx, t in enumerate(token_ids):
-            book = token_to_book.get(str(t), {})
+            # fallback if missing
+            if book is None:
+                book = fetch_book_single(str(t))
+                if book is not None:
+                    token_to_book[str(t)] = book
 
-            best_bid, best_bid_size, best_ask, best_ask_size, mid, spr = best_from_book(book) if book else (None, None, None, None, None, None)
+            book_found = book is not None
+            best_bid, best_bid_size, best_ask, best_ask_size, mid, spr = (
+                best_from_book(book) if book_found else (None, None, None, None, None, None)
+            )
 
-            outcome = None
-            if idx < len(outcomes):
-                outcome = outcomes[idx]
+            outcome = outcomes[idx] if idx < len(outcomes) else None
 
             rows.append(
                 {
@@ -429,33 +395,30 @@ def snapshot_league(league: str, tag_id: str) -> pd.DataFrame:
                     "market_slug": rec["market_slug"],
                     "market_question": rec["market_question"],
                     "condition_id": rec["condition_id"],
+                    "clob_token_ids_raw": rec["clob_token_ids_raw"],
+                    "token_ids_parsed": "|".join(rec["token_ids"]),
                     "token_id": str(t),
                     "outcome": outcome,
+                    "book_found": book_found,
                     "best_bid": best_bid,
                     "best_bid_size": best_bid_size,
                     "best_ask": best_ask,
                     "best_ask_size": best_ask_size,
                     "mid": mid,
                     "spread": spr,
-                    "book_hash": book.get("hash") if book else None,
-                    "tick_size": book.get("tick_size") if book else None,
-                    "min_order_size": book.get("min_order_size") if book else None,
-                    "last_trade_price": book.get("last_trade_price") if book else None,
+                    "book_hash": book.get("hash") if book_found else None,
+                    "tick_size": book.get("tick_size") if book_found else None,
+                    "min_order_size": book.get("min_order_size") if book_found else None,
+                    "last_trade_price": book.get("last_trade_price") if book_found else None,
                     "liquidity": rec["liquidity"],
                     "volume": rec["volume"],
-                    "error": None if book else "book_missing",
                 }
             )
 
     df = pd.DataFrame(rows)
-
-    # helpful diagnostic line (shows if token parsing is still broken)
-    hit = df["book_hash"].notna().sum()
-    total = df["token_id"].notna().sum()
-    print(f"[{league}] books present rows: {hit}/{max(1,total)} ({hit/max(1,total):.2%}) errors={len(errors)}")
-    if errors:
-        print(f"[{league}] sample error: {errors[0]}")
-
+    hit = int(df["book_found"].sum()) if not df.empty else 0
+    total = len(df) if not df.empty else 0
+    print(f"[{league}] books found rows: {hit}/{max(1,total)} ({hit/max(1,total):.2%})")
     return df
 
 
@@ -486,7 +449,6 @@ def main():
 
         df = snapshot_league(lg, tag_id)
         out = append_daily_csv(df, lg)
-
         print(f"saved: {out} rows={len(df)} (tag_id={tag_id})")
 
 
