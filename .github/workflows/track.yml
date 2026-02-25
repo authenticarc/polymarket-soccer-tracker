@@ -31,9 +31,9 @@ jobs:
       - name: Run tracker
         env:
           LEAGUES: "UCL,EPL"
-          # 固定写死 sport_id，保证稳定运行
-          SPORT_ID_UCL: "13"
-          SPORT_ID_EPL: "2"
+          # 可选：一旦你确认了正确 tag_id，建议固定写死，最稳
+          # TAG_UCL: "100977"
+          # TAG_EPL: "82"
         run: |
           python tracker.py
 

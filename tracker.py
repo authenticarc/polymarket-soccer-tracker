@@ -1,7 +1,7 @@
 import os
 import time
 import datetime as dt
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import pandas as pd
@@ -12,7 +12,7 @@ CLOB = "https://clob.polymarket.com"
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "User-Agent": "polymarket-ucl-epl-tracker/0.3",
+        "User-Agent": "polymarket-ucl-epl-tracker/0.4",
         "Accept": "application/json",
     }
 )
@@ -50,42 +50,102 @@ def best_level(side: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
 
 
 # ----------------------------
-# League mapping & discovery
+# League config (UCL + EPL only)
 # ----------------------------
-LEAGUE_TO_SPORT_CODE = {
-    "UCL": "ucl",
-    "EPL": "epl",
+LEAGUES = {
+    "UCL": {
+        "sport_code": "ucl",
+        "tag_keywords": ["champions league", "uefa champions league", "ucl"],
+    },
+    "EPL": {
+        "sport_code": "epl",
+        "tag_keywords": ["premier league", "epl", "english premier league"],
+    },
 }
 
-def discover_sport_id(league_code: str, sports_payload: List[Dict[str, Any]]) -> int:
+
+def parse_tags_csv(tags: Optional[str]) -> List[int]:
+    if not tags:
+        return []
+    out = []
+    for x in str(tags).split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.append(int(x))
+        except ValueError:
+            pass
+    return out
+
+
+def get_sport_meta_by_code(sports_payload: List[Dict[str, Any]], sport_code: str) -> Dict[str, Any]:
+    for s in sports_payload:
+        if (s.get("sport") or "").lower() == sport_code.lower():
+            return s
+    raise RuntimeError(f"Could not find sport metadata for sport='{sport_code}'.")
+
+
+def choose_league_tag_id(league_code: str, sports_payload: List[Dict[str, Any]]) -> int:
     """
-    Prefer env override SPORT_ID_<LEAGUE>.
-    Otherwise, match by sports_payload[].sport == LEAGUE_TO_SPORT_CODE[league_code].
+    Pick a league-specific tag_id by:
+    1) taking sport metadata object's `tags` string,
+    2) resolving each tag via /tags/{id},
+    3) selecting the one whose name/slug best matches league keywords.
+    Docs emphasize filtering events via tag_id. :contentReference[oaicite:3]{index=3}
     """
-    override = os.getenv(f"SPORT_ID_{league_code}")
+    # Allow hard override (most stable in production)
+    override = os.getenv(f"TAG_{league_code}")
     if override:
         return int(override)
 
-    sport_code = LEAGUE_TO_SPORT_CODE.get(league_code)
-    if not sport_code:
-        raise ValueError(f"Unknown league_code={league_code}. Add to LEAGUE_TO_SPORT_CODE.")
+    cfg = LEAGUES[league_code]
+    sport_meta = get_sport_meta_by_code(sports_payload, cfg["sport_code"])
+    tag_ids = parse_tags_csv(sport_meta.get("tags"))
 
-    for s in sports_payload:
-        if (s.get("sport") or "").lower() == sport_code:
-            return int(s["id"])
+    if not tag_ids:
+        raise RuntimeError(f"No tags found in /sports metadata for {league_code} ({cfg['sport_code']}).")
 
-    raise RuntimeError(
-        f"Could not auto-detect sport_id for {league_code} (sport='{sport_code}'). "
-        f"Set env SPORT_ID_{league_code} manually."
-    )
+    keywords = [k.lower() for k in cfg["tag_keywords"]]
+
+    # Resolve tags and score them
+    best: Tuple[int, int, str] = (-1, -10**9, "")
+    for tid in tag_ids:
+        try:
+            t = safe_get(f"{GAMMA}/tags/{tid}")
+        except Exception:
+            continue
+        name = (t.get("name") or "").lower()
+        slug = (t.get("slug") or "").lower()
+        text = f"{name} {slug}"
+
+        score = 0
+        for kw in keywords:
+            if kw in text:
+                score += 10
+        # Prefer longer/more specific names if tie
+        score += min(len(name), 50) // 10
+
+        if score > best[1]:
+            best = (tid, score, text)
+
+        time.sleep(0.05)
+
+    if best[0] == -1 or best[1] <= 0:
+        # As fallback, pick the largest tag id (often more specific than generic '1' etc.)
+        # But strongly recommend setting TAG_<LEAGUE> env if this happens.
+        return max(tag_ids)
+
+    return best[0]
 
 
 # ----------------------------
-# Fetch events & markets
+# Fetch events & markets (by tag_id)
 # ----------------------------
-def fetch_events_by_sport(sport_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+def fetch_events_by_tag(tag_id: int, limit: int = 100) -> List[Dict[str, Any]]:
     """
-    Fetch active, open events for a given sport_id.
+    Correct filter: /events?tag_id=...
+    :contentReference[oaicite:4]{index=4}
     """
     events: List[Dict[str, Any]] = []
     offset = 0
@@ -93,11 +153,12 @@ def fetch_events_by_sport(sport_id: int, limit: int = 100) -> List[Dict[str, Any
         batch = safe_get(
             f"{GAMMA}/events",
             params={
-                "sport_id": sport_id,
+                "tag_id": tag_id,
                 "active": "true",
                 "closed": "false",
                 "limit": limit,
                 "offset": offset,
+                "related_tags": "true",
             },
         )
         if not batch:
@@ -111,10 +172,6 @@ def fetch_events_by_sport(sport_id: int, limit: int = 100) -> List[Dict[str, Any
 
 
 def flatten_markets(events: List[Dict[str, Any]], league_code: str) -> pd.DataFrame:
-    """
-    Expand events -> markets -> token rows.
-    Record full market metadata (all markets, no filtering).
-    """
     rows = []
     for ev in events:
         ev_id = ev.get("id")
@@ -124,10 +181,8 @@ def flatten_markets(events: List[Dict[str, Any]], league_code: str) -> pd.DataFr
 
         mkts = ev.get("markets") or []
         for m in mkts:
-            # Keep all orderbook-enabled markets
             if m.get("enableOrderBook") is False:
                 continue
-
             clob_tokens = m.get("clobTokenIds") or m.get("clob_token_ids") or []
             if not clob_tokens:
                 continue
@@ -154,7 +209,6 @@ def flatten_markets(events: List[Dict[str, Any]], league_code: str) -> pd.DataFr
     if df.empty:
         return df
 
-    # One row per token id
     df = df.explode("clobTokenIds", ignore_index=True).rename(columns={"clobTokenIds": "token_id"})
     df["token_id"] = df["token_id"].astype(str)
     return df
@@ -164,9 +218,6 @@ def flatten_markets(events: List[Dict[str, Any]], league_code: str) -> pd.DataFr
 # Fetch orderbooks in batch
 # ----------------------------
 def fetch_books(token_ids: List[str], batch_size: int = 200) -> Dict[str, Dict[str, Any]]:
-    """
-    Batch fetch orderbooks from CLOB.
-    """
     out: Dict[str, Dict[str, Any]] = {}
     for part in chunk(token_ids, batch_size):
         payload = [{"token_id": tid} for tid in part]
@@ -188,20 +239,20 @@ def fetch_books(token_ids: List[str], batch_size: int = 200) -> Dict[str, Dict[s
 def main():
     leagues_env = os.getenv("LEAGUES", "UCL,EPL")
     league_codes = [x.strip().upper() for x in leagues_env.split(",") if x.strip()]
-    if not league_codes:
-        raise RuntimeError("LEAGUES is empty")
+    for c in league_codes:
+        if c not in LEAGUES:
+            raise RuntimeError(f"Unsupported league '{c}'. Supported: {list(LEAGUES.keys())}")
 
     sports = safe_get(f"{GAMMA}/sports")
 
-    # Discover sport_ids for requested leagues
-    league_sport_ids: Dict[str, int] = {}
+    # Resolve tag_id per league (robust)
+    league_tag_ids: Dict[str, int] = {}
     for code in league_codes:
-        league_sport_ids[code] = discover_sport_id(code, sports)
+        league_tag_ids[code] = choose_league_tag_id(code, sports)
 
-    # Fetch events & markets for each league
     all_mkts = []
-    for code, sport_id in league_sport_ids.items():
-        events = fetch_events_by_sport(sport_id=sport_id, limit=100)
+    for code, tag_id in league_tag_ids.items():
+        events = fetch_events_by_tag(tag_id=tag_id, limit=100)
         mkts = flatten_markets(events, league_code=code)
         if not mkts.empty:
             all_mkts.append(mkts)
@@ -217,7 +268,6 @@ def main():
     books = fetch_books(token_ids)
 
     ts = utc_now_iso()
-
     rows = []
     for _, r in mkts_df.iterrows():
         tid = str(r["token_id"])
@@ -265,7 +315,6 @@ def main():
     os.makedirs("data", exist_ok=True)
     day = dt.datetime.utcnow().date().isoformat()
 
-    # Write per league
     for code in league_codes:
         part = out_df[out_df["league"] == code].copy()
         if part.empty:
@@ -274,6 +323,10 @@ def main():
         write_header = not os.path.exists(path)
         part.to_csv(path, mode="a", index=False, header=write_header)
         print(f"Wrote {len(part)} rows -> {path}")
+
+    # Helpful debug line (so you can pin TAG_UCL/TAG_EPL once stable)
+    print("League tag_ids used:", league_tag_ids)
+
 
 if __name__ == "__main__":
     main()
